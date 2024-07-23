@@ -5,6 +5,13 @@ using Dalamud.IoC;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Microsoft.Extensions.DependencyInjection;
+using TTSPlogon.Clients;
+using TTSPlogon.Clients.OpenAi;
+using TTSPlogon.Clients.SpeechSynthesisClient;
+using TTSPlogon.Providers;
+using TTSPlogon.Queue;
+using TTSPlogon.Sound;
+using TTSPlogon.Utils;
 
 namespace TTSPlogon;
 
@@ -22,6 +29,9 @@ public sealed class Plugin : IDalamudPlugin
         [PluginService] public IChatGui ChatGui { get; set; } = null!;
         [PluginService] public IGameGui GameGui { get; set; } = null!;
         [PluginService] public IClientState ClientState { get; set; } = null!;
+        [PluginService] public ISigScanner SigScanner { get; set; } = null!;
+        [PluginService] public IGameInteropProvider Interop { get; set; } = null!;
+        [PluginService] public IObjectTable ObjectTable { get; set; } = null!;
         
         public void RegisterServices(IServiceCollection services)
         {
@@ -32,7 +42,9 @@ public sealed class Plugin : IDalamudPlugin
             services.AddSingleton(ChatGui);
             services.AddSingleton(GameGui);
             services.AddSingleton(ClientState);
-            
+            services.AddSingleton(SigScanner);
+            services.AddSingleton(Interop);
+            services.AddSingleton(ObjectTable);
         }
     }
 
@@ -40,7 +52,8 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin(IDalamudPluginInterface pluginInterface)
     {
-        var config = pluginInterface.GetPluginConfig() as PluginConfig ?? new PluginConfig(pluginInterface);
+        var config = pluginInterface.GetPluginConfig() as PluginConfig ?? new PluginConfig();
+        PluginConfig.PluginInterface = pluginInterface;
         
         pluginInterface.Inject(services);
         
@@ -48,21 +61,62 @@ public sealed class Plugin : IDalamudPlugin
             .AddSingleton<MainWindow>()
             .AddSingleton<SoundQueue>()
             .AddSingleton<HttpClient>()
-            .AddSingleton<OpenAiClient>()
             .AddSingleton<PluginConfig>()
             .AddSingleton<EventHandler>()
-            .AddSingleton<EventProvider>()
             .AddSingleton<QueueProcessor>()
+            .AddSingleton<SoundHandler>()
+            .AddSingleton<LexiconHandler>()
             .AddSingleton(config);
+        
+        // get ISpeechClient types
+        var speechClients = typeof(ISpeechClient).Assembly.GetTypes()
+            .Where(x => x is {IsClass: true, IsAbstract: false} && x.GetInterfaces().Contains(typeof(ISpeechClient)));
+        // add as collection
+        foreach (var client in speechClients)
+        {
+            serviceCollection.AddSingleton(typeof(ISpeechClient), client);
+        }
+        var eventProviders = typeof(IEventProvider).Assembly.GetTypes()
+            .Where(x => x is {IsClass: true, IsAbstract: false} && x.GetInterfaces().Contains(typeof(IEventProvider)));
+        foreach (var provider in eventProviders)
+        {
+            serviceCollection.AddSingleton(typeof(IEventProvider), provider);
+        }
+        
+        
         services.RegisterServices(serviceCollection);
         serviceProvider = serviceCollection.BuildServiceProvider();
         
         // lazy init
         var qp = serviceProvider.GetRequiredService<QueueProcessor>();
-        var ep = serviceProvider.GetRequiredService<EventProvider>();
         var eh = serviceProvider.GetRequiredService<EventHandler>();
+        var sh = serviceProvider.GetRequiredService<SoundHandler>();
+        var epTypes = serviceProvider.GetServices<IEventProvider>();
         
-        services.CommandManager.AddHandler("/ttsplogon", new CommandInfo(OnCommand)
+        services.CommandManager.AddHandler("/ttsplogon", new CommandInfo((command, args) =>
+        {
+            switch (args)
+            {
+                case "toggle":
+                    config.Enabled = !config.Enabled;
+                    config.Save();
+                    services.ChatGui.Print($"TTSPlogon is now {(config.Enabled ? "enabled" : "disabled")}");
+                    break;
+                case "on" or "enable":
+                    config.Enabled = true;
+                    config.Save();
+                    services.ChatGui.Print("TTSPlogon is now enabled");
+                    break;
+                case "off" or "disable":
+                    config.Enabled = false;
+                    config.Save();
+                    services.ChatGui.Print("TTSPlogon is now disabled");
+                    break;
+                default:
+                    OpenUi();
+                    break;
+            }
+        })
         {
             HelpMessage = "Open the menu"
         });
@@ -70,13 +124,9 @@ public sealed class Plugin : IDalamudPlugin
         WindowSystem.AddWindow(serviceProvider.GetRequiredService<MainWindow>());
 
         services.PluginInterface.UiBuilder.Draw += WindowSystem.Draw;
+        services.PluginInterface.UiBuilder.DisableCutsceneUiHide = true;
         services.PluginInterface.UiBuilder.OpenMainUi += OpenUi;
         services.PluginInterface.UiBuilder.OpenConfigUi += OpenUi;
-    }
-
-    private void OnCommand(string command, string args)
-    {
-        OpenUi();
     }
     
     private void OpenUi()
