@@ -52,7 +52,7 @@ namespace TTSPlogon
                 switch (p)
                 {
                     case PlayerPayload pp:
-                        world = pp.World.Name;
+                        world = pp.World.Value.Name.ToString();
                         break;
                     case TextPayload tp when world != "" && tp.Text != null && tp.Text.Contains(world):
                         cleanString.AddText(tp.Text.Replace(world, ""));
